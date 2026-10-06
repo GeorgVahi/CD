@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {"type": "string", "enum": ["completed", "blocked"]},
+    "report": {"type": "string"},
+    "changed_paths": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["status", "report", "changed_paths"],
+  "additionalProperties": false
+}
