@@ -37,6 +37,8 @@ Use a unique run directory inside the current workspace's existing ignored local
 
 The coordinator maintains `tasks`: scope/base, dependencies, snapshots, scores, findings, checks, status, last repair cycle. Assignments have unique stable IDs, task ID, role, cycle, executor, input hash, start/end status, process/session identity, before/after snapshots, and results. The CLI runner records its own assignments; record native assignments in the same ledger with `backend: native` and `repair_started` when a fixer actually begins. Do not overwrite executor entries. Write state atomically only while no executor holds `executor.lock`.
 
+The coordinator separately owns `progress.json` for the two-hour overall chat summaries described in [progress-reporting.md](progress-reporting.md). Preserve its reporting deadline across executor switches and recovery. The executor does not read or write this file; atomic coordinator updates to it may continue while `executor.lock` protects the shared ledger. Do not include either state file or earlier progress summaries in reviewer-facing context.
+
 On migration from an older checkpoint, preserve its original run identity, task IDs, scores, snapshots, and `globalRepairCycle` as `current_cycle`. Convert task lists to an ID-keyed map. Keep the old checkpoint until migration is verified. Do not reset an interrupted review to cycle zero.
 
 Before dispatch, record the packet and exact source/dependency/test fingerprints. Before using a saved result, compare the fingerprints with current files and invalidate affected dependents. Do not credit scores from changed files. Successful transport alone never meets the 9.5 gate.

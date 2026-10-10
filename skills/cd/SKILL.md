@@ -23,6 +23,14 @@ The CLI fallback is part of this authorized workflow and runs against the same w
 
 Create or recover the local run checkpoint before dispatch. Switching executors, restarting this chat, or recovering a failed process must preserve completed results, task IDs, and the global cycle counter. In-flight or partially written work requires reconciliation before another writer starts.
 
+## Overall progress every two hours
+
+The coordinator must send an overall progress message **in the current user chat every two hours while this invocation is running**, including review-only runs. Start the reporting clock when the invocation begins, before decomposition or worker dispatch. Read [references/progress-reporting.md](references/progress-reporting.md) for the durable timer, counting rules, recovery, and examples. This summary is additional to any more frequent updates required by the host or project; ordinary brief updates do not reset its clock.
+
+Report how many subtasks are complete, how many remain, what is happening now, the repair cycle out of five (or review-only mode), changes since the last summary, blockers, and an approximate remaining-time range when supported by observed progress. Count a subtask as complete in repair mode only while it meets the full acceptance gate on its current snapshot. Clearly distinguish completed reviews from accepted implementations in review-only mode. Never invent a total, percentage, or ETA when evidence is insufficient.
+
+Check the real clock before dispatch and after each tool return or wait; use bounded waits so the coordinator can report while workers are still running. When a summary is due, send it even if no task has completed since the last one. Preserve the timer across compaction and executor switches. On recovery, send one overdue summary rather than a burst of missed updates. Report completion or a blocker that stops the run immediately, without waiting for the next two-hour deadline.
+
 ## 1. Establish scope and delegate decomposition
 
 Inspect the current repository state and available conversation before inferring scope. Record the repository root, branch, HEAD, relevant staged/unstaged/untracked paths, and any commits attributable to the chat. Read the applicable project instructions.

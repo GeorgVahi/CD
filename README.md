@@ -78,6 +78,14 @@ $cd Review only. Do not edit files, commit, or push.
 
 CD is **explicit-only**. Its metadata disables automatic invocation. Installing it does not register a custom `/cd` command.
 
+## Progress during long runs
+
+While CD is running, the coordinator sends an overall summary in the same chat **every two hours**, starting two hours after invocation. It reports completed and remaining subtasks, current work, the repair cycle, progress since the previous summary, blockers, and an approximate remaining-time range when actual timings support one. If the total or ETA is not yet known, it says so.
+
+In repair mode, only tasks that currently pass the full acceptance gate count as complete. Review-only summaries distinguish finished reviews from accepted work. Reports still arrive when no task has finished; shorter activity updates do not postpone the two-hour summary.
+
+The reporting deadline is saved with the run and survives compaction and executor changes. On resumption after an overdue deadline, CD sends one current summary and starts the next interval from that message. Completion and blocking issues that stop the run are reported immediately. Reporting stops when the run finishes or is paused; the skill cannot wake an inactive chat. See the [progress protocol](skills/cd/references/progress-reporting.md) for details.
+
 ## What happens
 
 1. The coordinator identifies work attributable to the chat, including committed changes, and records the repository state.
@@ -126,6 +134,7 @@ skills/cd/
 ├── agents/openai.yaml             Display metadata and explicit-only policy
 ├── references/review-contract.md  Scoring and handoff contracts
 ├── references/runtime-recovery.md Executor selection and recovery
+├── references/progress-reporting.md Two-hour summaries and ETA guidance
 ├── scripts/run_agent.py           One fresh CLI assignment
 ├── scripts/agent-report.schema.json
 └── tests/test_run_agent.py         Executor regression tests

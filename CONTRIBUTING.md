@@ -28,6 +28,8 @@ Tests use a fake CLI and temporary workspaces created inside the test directory.
 
 For documentation-only or packaging changes, inspect the relevant documents, validate the skill, and smoke-test installation into an isolated destination. Do not run a paid multi-agent review merely to validate wording.
 
+For changes to progress instructions, walk through the simulated timelines in [progress-reporting.md](skills/cd/references/progress-reporting.md#scenario-checks-for-changes-to-this-protocol). Cover the two-hour boundary, unchanged progress, recovery, invalidated acceptance, review-only counts, uncertain ETA, completion, and an executor holding the ledger lock. Keep this evidence distinct from a live two-hour chat-delivery test; the Python executor tests do not validate coordinator message timing.
+
 ## Packaging and releases
 
 - Keep every runtime reference inside `skills/cd`; folder-only installation must remain self-contained.
