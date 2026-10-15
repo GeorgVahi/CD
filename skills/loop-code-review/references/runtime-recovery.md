@@ -2,6 +2,8 @@
 
 Read this before the first delegation and when a worker fails. Recovery changes the execution mechanism, not scope, permissions, model, clean-context requirements, or the five-cycle limit.
 
+This file describes the Codex host. Under Claude Code, read [claude-code.md](claude-code.md) as well; it replaces the Codex-specific mechanisms here, and the durable state, cycle, and receipt rules stay shared.
+
 ## Select and release native workers
 
 1. Inspect the actual tool catalog, its slot limits, and the current agent list. Account for the root, existing workers, and completed-but-open workers according to the host's semantics. Do not infer that `completed` releases capacity.
@@ -66,7 +68,7 @@ Prepare a UTF-8 JSON request in the run directory. Example shape (replace the ex
 
 Optional fields: `cli_path` (absolute path to a discovered installed Codex binary), `model`, `reasoning_effort`. Omit model/effort to retain saved defaults when those match the current task. Roles are `decomposer`, `reviewer`, `fixer`; a fixer requires cycle 1–5, explicit `write_paths`, and `sandbox: workspace-write`. Use normalized workspace-relative file paths; `null` fingerprints represent not-yet-existing files. Scope must include relevant instructions, implementation, dependencies, and tests, and every authorized write path. Keep reports, prompts, and ledger out of reviewer scope.
 
-Run with the host's available Python 3.11+ executable, substituting absolute paths:
+Run with the host's available Python 3.9+ executable, substituting absolute paths:
 
 ```text
 python -B <skill>/scripts/run_agent.py --request <run-dir>/request.json --state-dir <run-dir>

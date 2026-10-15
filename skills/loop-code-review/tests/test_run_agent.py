@@ -63,9 +63,11 @@ class RunnerTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         # Non-Git fixtures must not inherit the enclosing skill repository.
         # Fixtures that initialize their own repository remain discoverable.
-        self.enterContext(patch.dict(os.environ, {
+        environment = patch.dict(os.environ, {
             "GIT_CEILING_DIRECTORIES": str(self.root.parent),
-        }))
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
         self.state = self.root / ".review-state"
         (self.root / "source.py").write_text("original\n")
         (self.root / "other.py").write_text("other\n")
