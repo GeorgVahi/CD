@@ -1,5 +1,7 @@
-"""Run one fresh Codex CLI assignment; no third-party dependencies.
+"""Run one fresh CLI assignment; no third-party dependencies.
 
+The host defaults to Codex (`codex exec`); a request with `"host": "claude"`
+runs a headless Claude Code worker (`claude -p`) through the same lifecycle.
 This executor records evidence, not acceptance. The coordinator owns scheduling,
 native-agent lifecycle, scoring, and the global review protocol.
 """
@@ -17,10 +19,25 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 SCHEMA = Path(__file__).with_name("agent-report.schema.json")
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
+HOSTS = {"codex": ("codex", "codex.exe"), "claude": ("claude", "claude.exe")}
+# Variables that bind a child process to the invoking Claude Code session.
+# Provider, authentication, and other user configuration are inherited unchanged.
+CLAUDE_SESSION_VARIABLES = frozenset({
+    "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_HOST_SESSION_ID",
+    "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_PID",
+    "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH",
+})
+# Rejections that can arrive before any repair work; they consume no cycle.
+PREWORK_REJECTIONS = frozenset({
+    "authentication", "quota", "agent_limit", "rate_limit", "cli_incompatible", "cli_unavailable",
+    "model_unavailable", "process_containment", "nested_session", "overloaded",
+})
 
 
 def atomic_json(path, value):
@@ -56,15 +73,21 @@ def local_path(root, relative):
     return path
 
 
+def file_sha256(path):
+    with path.open("rb") as stream:
+        if hasattr(hashlib, "file_digest"):  # Python 3.11+
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+        value = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            value.update(chunk)
+        return value.hexdigest()
+
+
 def fingerprint(root, paths):
     result = {}
     for name in sorted(set(paths)):
         path = local_path(root, name)
-        if path.is_file():
-            with path.open("rb") as stream:
-                result[name] = hashlib.file_digest(stream, "sha256").hexdigest()
-        else:
-            result[name] = None
+        result[name] = file_sha256(path) if path.is_file() else None
     return result
 
 
@@ -158,10 +181,13 @@ def validate(request, state):
     for key in ("model", "reasoning_effort"):
         if key in request and (not isinstance(request[key], str) or not request[key].strip()):
             raise ValueError(f"Invalid {key}.")
+    host = request.get("host", "codex")
+    if host not in HOSTS:
+        raise ValueError("host must be codex or claude.")
     if "cli_path" in request:
         cli = Path(request["cli_path"])
-        if not cli.is_absolute() or not cli.is_file() or cli.name.lower() not in ("codex", "codex.exe"):
-            raise ValueError("cli_path must identify a discovered installed Codex binary.")
+        if not cli.is_absolute() or not cli.is_file() or cli.name.lower() not in HOSTS[host]:
+            raise ValueError("cli_path must identify a discovered installed CLI of the requested host.")
     return root
 
 
@@ -186,6 +212,85 @@ def classify_error(text):
     if re.search(r"\b429\b", text):
         return "rate_limit"
     return "process_error"
+
+
+def classify_claude_error(text):
+    text = text.lower().replace("’", "'")
+    for category, phrases in (
+        ("cli_unavailable", ("executable unavailable",)),
+        ("process_containment", ("process containment unavailable",)),
+        ("nested_session", ("cannot be launched inside another claude code session",)),
+        ("cli_incompatible", ("unknown option", "is invalid. allowed choices", "requires a newer version")),
+        ("quota", ("billing_error", "hit your session limit", "hit your weekly limit", "hit your usage limit",
+                   "usage limit", "credit balance", "spend limit", "insufficient_quota")),
+        ("authentication", ("authentication_failed", "oauth_org_not_allowed", "account_on_hold", "not logged in",
+                            "please run /login", "invalid api key", "invalid authentication credentials",
+                            "oauth token has expired", "unauthorized")),
+        ("agent_limit", ("concurrent subagent limit",)),
+        ("overloaded", ("overloaded",)),
+        ("rate_limit", ("rate_limit", "rate limit", "too many requests", "request rejected (429)")),
+        ("model_unavailable", ("model_not_found", "model not found", "invalid model", "unsupported model")),
+        ("invalid_report", ("error_max_structured_output_retries",)),
+        ("permissions", ("permission denied", "access denied")),
+        ("network", ("econnrefused", "econnreset", "etimedout", "enotfound", "connection refused",
+                     "connection error", "fetch failed", "socket hang up", "server_error")),
+    ):
+        if any(phrase in text for phrase in phrases):
+            return category
+    if re.search(r"\b401\b", text):
+        return "authentication"
+    if re.search(r"\b529\b", text):
+        return "overloaded"
+    if re.search(r"\b429\b", text):
+        return "rate_limit"
+    return "process_error"
+
+
+def claude_event_summary(stream):
+    """Summarize `claude -p --output-format stream-json` events."""
+    stream.seek(0)
+    summary = {"session_id": None, "turn_started": False, "turn_completed": False, "work_started": False,
+               "errors": "", "result_error": False, "structured_output": None, "result": None,
+               "permission_denials": 0}
+
+    def note(value):
+        summary["errors"] = (summary["errors"] + json.dumps(value, ensure_ascii=False))[-65536:]
+
+    for raw in stream:
+        try:
+            event = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind, subtype = event.get("type"), event.get("subtype")
+        if kind == "system" and subtype == "init":
+            summary["session_id"] = event.get("session_id")
+            summary["turn_started"] = True
+        elif kind == "system" and subtype == "api_retry":
+            note({"api_retry": event.get("error"), "status": event.get("error_status")})
+        elif kind == "assistant":
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+            if any(b.get("type") == "tool_use" for b in blocks):
+                summary["work_started"] = True
+            if event.get("error"):
+                note({"assistant_error": event.get("error"),
+                      "text": " ".join(str(b.get("text", "")) for b in blocks if b.get("type") == "text")[:2000]})
+        elif kind == "result":
+            denials = event.get("permission_denials")
+            summary["permission_denials"] = len(denials) if isinstance(denials, list) else 0
+            if subtype == "success" and not event.get("is_error"):
+                summary["turn_completed"] = True
+                summary["structured_output"] = event.get("structured_output")
+                summary["result"] = event.get("result")
+            else:
+                summary["result_error"] = True
+                message = event.get("result")
+                note({"result": subtype, "errors": event.get("errors"),
+                      "message": message[:2000] if isinstance(message, str) else None})
+    return summary
 
 
 def event_summary(stream):
@@ -284,6 +389,64 @@ def build_command(prefix, request, root, output, is_git):
     return [*args, "-"]
 
 
+def build_claude_command(prefix, request, session):
+    """Headless Claude Code worker: new session, no persistence, no prompts.
+
+    Never add -c/--continue, -r/--resume, --fork-session, --bare, --safe-mode,
+    --restricted, or any permission bypass: each changes context or configuration.
+    """
+    read_only = request.get("sandbox", "read-only") == "read-only"
+    schema = json.dumps(json.loads(SCHEMA.read_text(encoding="utf-8")), separators=(",", ":"))
+    args = [*prefix, "-p", "--output-format", "stream-json", "--verbose",
+            "--no-session-persistence", "--session-id", session,
+            "--permission-mode", "default" if read_only else "acceptEdits",
+            "--permission-prompts", "none", "--json-schema", schema]
+    if read_only:
+        args += ["--tools", "Read,Grep,Glob,Bash", "--disallowedTools", "Edit,Write,NotebookEdit,Agent"]
+    else:
+        args += ["--disallowedTools", "Agent"]
+    if request.get("model"):
+        args += ["--model", request["model"]]
+    if request.get("reasoning_effort"):
+        args += ["--effort", request["reasoning_effort"]]
+    return args
+
+
+def worker_header(host, role, request):
+    instructions, command, envelope = (
+        ("Read applicable CLAUDE.md and AGENTS.md files and obey their instructions within this assignment. ",
+         "/loop-code-review", "the required JSON envelope as structured output")
+        if host == "claude" else
+        ("Read applicable AGENTS.md and obey its instructions within this assignment. ",
+         "$loop-code-review", "the required JSON envelope"))
+    return ("You are a fresh, bounded code-review worker, not the workflow coordinator. "
+            f"Do not spawn/delegate, resume other sessions, invoke the {command} workflow, "
+            "read earlier chats/review reports/coordinator state, or commit/push. "
+            f"{instructions}"
+            "Never read or print credentials. Preserve unrelated edits. "
+            f"Return {envelope}; report completed means assignment finished, not quality accepted.\n"
+            f"Role: {role}. Authorized write files: {json.dumps(request.get('write_paths', []))}.\n")
+
+
+def child_environment(host):
+    """Codex inherits the environment as before; Claude drops session bindings."""
+    if host != "claude":
+        return None
+    return {k: v for k, v in os.environ.items() if k not in CLAUDE_SESSION_VARIABLES}
+
+
+def save_claude_report(path, summary):
+    value = summary["structured_output"]
+    if value is None and isinstance(summary["result"], str):
+        try:
+            value = json.loads(summary["result"])
+        except ValueError:
+            value = None
+    if value is None or path.exists():
+        raise ValueError("No structured report.")
+    atomic_json(path, value)
+
+
 def validate_report(path):
     report = read_json(path)
     if not isinstance(report, dict) or set(report) != {"status", "report", "changed_paths"}:
@@ -360,12 +523,13 @@ def run_locked(request, root, state, is_git, command):
     if pre_scope != request["expected_snapshot"]:
         return outcome("stale", "snapshot_changed")
     before = inventory(root, state, scope, is_git)
+    host = request.get("host", "codex")
     entry = outcome("prepared", None, request_hash=request_hash, assignment_id=assignment,
-                    task_id=request["task_id"], role=role, cycle=cycle, backend="cli",
+                    task_id=request["task_id"], role=role, cycle=cycle, backend="cli", host=host,
                     fresh_context=True, pre_snapshot=pre_scope, started_at=time.time())
     ledger["assignments"][assignment] = entry
     atomic_json(ledger_path, ledger)
-    binary = request.get("cli_path") or shutil.which("codex")
+    binary = request.get("cli_path") or shutil.which(HOSTS[host][0])
     prefix = command or ([binary] if binary else None)
     if not prefix:
         entry.update(status="blocked", category="cli_unavailable")
@@ -378,22 +542,21 @@ def run_locked(request, root, state, is_git, command):
         entry.update(status="blocked", category="orphan_report", needs_reconciliation=True)
         atomic_json(ledger_path, ledger)
         return entry
-    args = build_command(prefix, request, root, output, is_git)
+    # Claude has no output-file flag: the runner saves its structured output itself.
+    session = str(uuid.uuid4()) if host == "claude" else None
+    if host == "claude":
+        args = build_claude_command(prefix, request, session)
+    else:
+        args = build_command(prefix, request, root, output, is_git)
     if os.name == "nt":
         args = [sys.executable, "-B", str(Path(__file__).resolve()), "--supervise", *args]
-    header = ("You are a fresh, bounded code-review worker, not the workflow coordinator. "
-              "Do not spawn/delegate, resume other sessions, invoke the $cd workflow, "
-              "read earlier chats/review reports/coordinator state, or commit/push. "
-              "Read applicable AGENTS.md and obey its instructions within this assignment. "
-              "Never read or print credentials. Preserve unrelated edits. "
-              "Return the required JSON envelope; report completed means assignment finished, not quality accepted.\n"
-              f"Role: {role}. Authorized write files: {json.dumps(request.get('write_paths', []))}.\n")
+    header = worker_header(host, role, request)
     code, failure, process = None, None, None
     summary = {"session_id": None, "turn_started": False, "turn_completed": False, "work_started": False, "errors": ""}
     with tempfile.TemporaryFile(dir=state) as stdout, tempfile.TemporaryFile(dir=state) as stderr:
         try:
             process = subprocess.Popen(args, cwd=root, stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
-                                       start_new_session=os.name != "nt",
+                                       env=child_environment(host), start_new_session=os.name != "nt",
                                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
             entry.update(status="running", pid=process.pid)
             atomic_json(ledger_path, ledger)
@@ -419,27 +582,33 @@ def run_locked(request, root, state, is_git, command):
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-        summary = event_summary(stdout)
+        summary = claude_event_summary(stdout) if host == "claude" else event_summary(stdout)
         stderr.seek(0, os.SEEK_END)
         stderr.seek(max(0, stderr.tell() - 65536))
-        error_category = classify_error(summary["errors"] or stderr.read().decode("utf-8", errors="replace"))
+        classify = classify_claude_error if host == "claude" else classify_error
+        error_category = classify(summary["errors"] or stderr.read().decode("utf-8", errors="replace"))
     after = inventory(root, state, scope, is_git)
     changed = sorted(name for name in set(before) | set(after) if before.get(name) != after.get(name))
     entry.update(post_snapshot=fingerprint(root, scope), changed_paths=changed,
                  session_id=summary["session_id"], exit_code=code, finished_at=time.time())
-    prework_rejection = (failure or error_category) in {"authentication", "quota", "agent_limit", "rate_limit",
-        "cli_incompatible", "cli_unavailable", "model_unavailable", "process_containment"} and not changed and not summary["work_started"]
+    if host == "claude":
+        entry["permission_denials"] = summary["permission_denials"]
+    prework_rejection = (failure or error_category) in PREWORK_REJECTIONS and not changed and not summary["work_started"]
     entry["repair_started"] = role == "fixer" and bool(changed or summary["work_started"] or (summary["turn_started"] and not prework_rejection))
     if entry["repair_started"]:
         ledger["current_cycle"] = max(current, cycle)
-    if failure or code != 0:
+    if failure or code != 0 or summary.get("result_error"):
         entry.update(status="blocked", category=failure or error_category)
     elif not summary["turn_completed"] or not isinstance(summary["session_id"], str) or not summary["session_id"]:
         entry.update(status="blocked", category="incomplete_run")
+    elif session is not None and summary["session_id"] != session:
+        entry.update(status="blocked", category="session_mismatch", fresh_context=False)
     elif any(a is not entry and a.get("session_id") == summary["session_id"] for a in ledger["assignments"].values()):
         entry.update(status="blocked", category="context_reused", fresh_context=False)
     else:
         try:
+            if host == "claude":
+                save_claude_report(output, summary)
             report = validate_report(output)
             entry.update(status=report["status"], category=None if report["status"] == "completed" else "agent_blocked", result=report)
         except (ValueError, OSError):

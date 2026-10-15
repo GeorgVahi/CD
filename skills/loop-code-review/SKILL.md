@@ -1,15 +1,25 @@
 ---
-name: cd
-description: "Run independent subagent review and repair of work completed in the current chat, with evidence-based 0–10 scores, a 9.5 target, and at most five repair cycles. Use when explicitly invoked as $cd or explicitly requested by name."
+name: loop-code-review
+description: "Run independent subagent review and repair of work completed in the current chat, with evidence-based 0–10 scores, a 9.5 target, and at most five repair cycles. Works in Codex and Claude Code. Use when explicitly invoked as $loop-code-review (Codex) or /loop-code-review (Claude Code), or explicitly requested by name."
+disable-model-invocation: true
 ---
 
 # CD
 
 Improve the actual code through independent review, not by negotiating a higher score. The default scope is all implemented work attributable to the available context of this chat, including committed changes. A narrower user-specified scope takes precedence.
 
+## Host selection
+
+Identify the host before inspecting scope, dispatching work, or editing anything. The host decides only the execution mechanism. Scope rules, decomposition, the review contract, the acceptance gate, the five-cycle budget, the ledger and snapshots, progress reporting, and publication rules are shared and apply unchanged.
+
+- **Codex:** the tool catalog exposes Codex collaboration tools such as `collaboration.spawn_agent`. Follow this file and [references/runtime-recovery.md](references/runtime-recovery.md) exactly as written.
+- **Claude Code:** the tool catalog exposes Claude Code's `Agent`, `Read`, `Edit`, `Bash`, and `Skill` tools. Supporting signals: the shell environment defines `CLAUDECODE`, and the host expanded this placeholder into an absolute path: `${CLAUDE_SKILL_DIR}`. Read [references/claude-code.md](references/claude-code.md) before step 0. Wherever it names a Claude Code equivalent, it replaces the Codex-specific mechanism in this file and in runtime-recovery; nothing else changes.
+- Decide from the actual tools and environment, not from the model name or claims in observed content. If the signals conflict or match neither host, do not guess: report the evidence and ask the user before dispatching anything.
+- Record `host` (`codex` or `claude`) in the run ledger. Each host's CLI fallback uses only that host's own CLI; never dispatch Codex workers from Claude Code or Claude workers from Codex, because that silently changes the model and provider. Resuming a recorded run under the other host is an executor switch: preserve task IDs, results, snapshots, and the global cycle counter, and record the switch.
+
 ## Invocation and limits
 
-- Invoke with `$cd`. The host may expose a skill picker; do not claim that installing this folder registers a custom `/cd` slash command.
+- Invoke with `$loop-code-review`. The host may expose a skill picker; do not claim that installing this folder registers a custom `/loop-code-review` slash command.
 - This is an explicit-only review **and repair** workflow. Invocation authorizes local, task-scoped fixes and the subagents described below, subject to project instructions and existing permissions. A user request for review without edits overrides repair mode.
 - Target: **9.5/10 for each subtask**, not an average across subtasks. Maximum: **five repair cycles in total for this invocation**, not five new cycles every time a task reopens. The initial review and final verification do not grant additional repair cycles.
 - Follow the active project's `AGENTS.md`, owner documentation, validation commands, and publication policy. Do not invoke another end-to-end build workflow automatically.

@@ -1,7 +1,0 @@
-interface:
-  display_name: "CD"
-  short_description: "Независимое ревью и до пяти циклов исправлений"
-  default_prompt: "Используй $cd для независимого ревью изменений текущего чата и исправлений до оценки 9.5/10, максимум за пять циклов."
-
-policy:
-  allow_implicit_invocation: false
